@@ -50,7 +50,7 @@ class StableLagrangianOptimizer:
         self.violation_history = []
         self.step_count = 0
 
-    def update_multipliers(self, violations, adaptive_lr=1e-4):
+    '''def update_multipliers(self, violations, adaptive_lr=1e-4):
         """稳定的拉格朗日乘数更新"""
 
         # 记录违反历史，用于自适应调整
@@ -75,6 +75,54 @@ class StableLagrangianOptimizer:
         )
         self.lambda2 = np.clip(
             self.lambda2 + effective_lr * violations[1],
+            0.0, self.max_lambda
+        )
+
+        # 引入衰减防止长期累积
+        if self.step_count % 10 == 0:  # 每10步进行一次衰减
+            self.lambda1 *= self.decay_factor
+            self.lambda2 *= self.decay_factor
+
+        self.step_count += 1
+
+        return self.lambda1, self.lambda2'''
+
+    # 在 pipeline/trainer.py 的 StableLagrangianOptimizer 类中
+
+    def update_multipliers(self, violations, adaptive_lr=1e-4):
+        """稳定的拉格朗日乘数更新（已修复设备不匹配问题）"""
+
+        # --- 这是核心修改点 ---
+        # 在方法开始时，立即将GPU张量转换为CPU上的标量值
+        violation1_scalar = violations[0].item()  # .item() 会自动完成 .detach().cpu() 并提取数值
+        violation2_scalar = violations[1]  # violations[1] 本身就是CPU上的浮点数，无需改变
+
+        cpu_violations = [violation1_scalar, violation2_scalar]
+        # ---------------------
+
+        # 记录违反历史，用于自适应调整
+        self.violation_history.append(cpu_violations)  # 确保历史记录中只包含CPU标量
+        if len(self.violation_history) > 20:
+            self.violation_history = self.violation_history[-20:]
+
+        # 计算自适应学习率
+        if len(self.violation_history) > 5:
+            # 现在这里的np.array操作是安全的
+            recent_violations = np.array(self.violation_history[-5:])
+            violation_variance = np.var(recent_violations, axis=0)
+            # 如果违反程度变化剧烈，降低学习率
+            lr_scale = 1.0 / (1.0 + violation_variance.mean())
+            effective_lr = adaptive_lr * lr_scale
+        else:
+            effective_lr = adaptive_lr
+
+        # 更新拉格朗日乘数，确保有界性 (现在这里的运算也是安全的)
+        self.lambda1 = np.clip(
+            self.lambda1 + effective_lr * violation1_scalar,  # 使用转换后的标量值
+            0.0, self.max_lambda
+        )
+        self.lambda2 = np.clip(
+            self.lambda2 + effective_lr * violation2_scalar,  # 使用转换后的标量值
             0.0, self.max_lambda
         )
 
@@ -113,7 +161,7 @@ class BalancedLossCalculator:
         self.base_weights = {
             'classification': 1.0,  # 主要任务
             'distillation': 0.1,  # 知识蒸馏辅助
-            'lagrangian': 0.01,  # 约束惩罚
+            'lagrangian': 1.0,  # 约束惩罚
             'regularization': 0.001  # 正则化
         }
 
@@ -285,7 +333,7 @@ class DistillTrainer(DefaultTrainer):
 
         self.distill_switch = False
         self.kl_loss = nn.KLDivLoss(reduction="batchmean", log_target=True)
-        self.mse_loss = nn.MSELoss()
+        # self.mse_loss = nn.MSELoss() # REMOVED: No longer needed for hidden layer distillation
 
         self.start_sparsity = 1.
         self.target_sparsity = self.args.target_sparsity
@@ -384,7 +432,7 @@ class DistillTrainer(DefaultTrainer):
                         p for n, p in opt_model.named_parameters() if (n in self.reg_params and "reg" not in n)
                     ],
                     "weight_decay": 0.0,
-                    "lr": min(self.args.reg_learning_rate, 1e-6),  # 🚨 限制正则化学习率上界
+                    "lr": self.args.reg_learning_rate,  # 🚨 限制正则化学习率上界
                 },
                 {
                     "params": [
@@ -454,6 +502,24 @@ class DistillTrainer(DefaultTrainer):
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
+    def _compute_differentiable_sparsity_ratio(self):
+        """计算一个可微分的、基于所有mask的L0范数期望值的稀疏率代理"""
+        total_L0_norm = 0
+        total_mask_params = 0
+        # 遍历所有层的mask组
+        for mask_group in self.per_layer_mask_groups:
+            for mask in mask_group:
+                # L() 返回的是期望保留的参数量（或维度）
+                total_L0_norm += mask.L().sum()
+                total_mask_params += mask.features
+
+        if total_mask_params == 0:
+            return 0.0
+
+        # 返回期望的“保留率”，即 1 - 稀疏率
+        expected_retention_ratio = total_L0_norm / total_mask_params
+        return expected_retention_ratio
+
     def compute_loss(self, model, inputs, return_outputs=False):
         """
         ✅ 修复后的损失计算方法
@@ -463,10 +529,13 @@ class DistillTrainer(DefaultTrainer):
             labels = inputs.pop("labels")
         else:
             labels = None
+
+        # MODIFIED: output_hidden_states is still needed for the s_logits, but not for t_hidden_states
         if "output_hidden_states" in inputs:
             inputs["output_hidden_states"] = inputs["output_hidden_states"] or self.distill_switch
         else:
             inputs["output_hidden_states"] = self.distill_switch
+
         outputs = model(**inputs)
 
         # Save past state if it exists
@@ -497,7 +566,7 @@ class DistillTrainer(DefaultTrainer):
                     unwrap_model(model),
                     inputs,
                     outputs["logits"],
-                    outputs["hidden_states"]
+                    # s_hidden_states is no longer needed as an argument
                 )
                 if torch.isfinite(distill_loss) and distill_loss < 10:
                     loss_dict['distillation'] = distill_loss
@@ -507,9 +576,9 @@ class DistillTrainer(DefaultTrainer):
                 print(f"⚠️ 蒸馏损失计算失败: {e}")
 
         # ✅ 稳定的拉格朗日损失
-        if self.distill_switch:
+        '''if self.distill_switch:
             try:
-                # 计算当前模型稀疏率
+                # 计算当前模型稀疏率 - MODIFICATION: This is where we use the unified standard
                 current_sparsity = self._compute_current_sparsity(unwrap_model(model))
                 target_sparsity = self.target_sparsity
 
@@ -530,6 +599,40 @@ class DistillTrainer(DefaultTrainer):
                     loss_dict['lagrangian'] = lagrangian_loss
 
                 # 记录统计信息
+                self.training_stats['lambda_history']['lambda1'].append(lambda1)
+                self.training_stats['lambda_history']['lambda2'].append(lambda2)
+
+            except Exception as e:
+                print(f"⚠️ 拉格朗日损失计算失败: {e}")'''
+        if self.distill_switch:
+            try:
+                # --- 这是核心修改点 ---
+                # 使用可微分的稀疏率代理来计算约束，以确保梯度流
+                differentiable_retention = self._compute_differentiable_sparsity_ratio()
+                # 目标保留率 = 1 - 目标稀疏率
+                target_retention = 1.0 - self.target_sparsity
+                sparsity_violation = differentiable_retention - target_retention
+
+                # 保留实际稀疏率用于日志监控
+                current_sparsity_for_log = self._compute_current_sparsity(unwrap_model(model))
+                # ---------------------
+
+                violations = [sparsity_violation, 0.0]
+
+                # 更新拉格朗日乘数
+                lambda1, lambda2 = self.lagrangian_optimizer.update_multipliers(violations)
+
+                # 计算拉格朗日损失
+                lagrangian_loss = self.lagrangian_optimizer.compute_lagrangian_loss(
+                    [torch.tensor(sparsity_violation, device=classification_loss.device),
+                     torch.tensor(0.0, device=classification_loss.device)]
+                )
+
+                if torch.isfinite(lagrangian_loss):
+                    loss_dict['lagrangian'] = lagrangian_loss
+
+                # 记录统计信息 (使用实际稀疏率)
+                self.training_stats['sparsity_history'].append(current_sparsity_for_log)
                 self.training_stats['lambda_history']['lambda1'].append(lambda1)
                 self.training_stats['lambda_history']['lambda2'].append(lambda2)
 
@@ -572,19 +675,21 @@ class DistillTrainer(DefaultTrainer):
                                       model: SModel,
                                       inputs: Dict,
                                       s_logits: torch.Tensor,
-                                      s_hidden_states: torch.Tensor,
+                                      # s_hidden_states: torch.Tensor, # REMOVED: No longer needed
                                       ):
         """
-        自适应蒸馏损失计算
-        根据当前稀疏率动态调整蒸馏权重
+        MODIFIED: 自适应蒸馏损失计算 (简化版)
+        - 移除对隐藏层的特征蒸馏，只保留对logits的蒸馏
+        - 极大提升训练稳定性和速度
         """
         with torch.no_grad():
-            assert "output_hidden_states" in inputs and inputs["output_hidden_states"] is True
-            t_outputs = self.t_model(**inputs)
+            # Set output_hidden_states to False for teacher model to save computation
+            inputs_for_teacher = inputs.copy()
+            inputs_for_teacher["output_hidden_states"] = False
+            t_outputs = self.t_model(**inputs_for_teacher)
             t_logits = t_outputs["logits"]
-            t_hidden_states = t_outputs["hidden_states"]
+            # t_hidden_states no longer fetched
 
-        mask: torch.Tensor = inputs["attention_mask"]
         T = self.args.distill_T
 
         # ✅ 计算当前稀疏率并获取自适应蒸馏权重
@@ -595,47 +700,32 @@ class DistillTrainer(DefaultTrainer):
         self.training_stats['sparsity_history'].append(current_sparsity)
         self.training_stats['distill_weight_history'].append(adaptive_distill_lambda)
 
-        # 预测蒸馏损失
+        # 预测蒸馏损失 (Logits-based KL Divergence)
         pred_loss = self.kl_loss(
             torch.log_softmax(s_logits / T, dim=-1),
             torch.log_softmax(t_logits / T, dim=-1),
         ) * (T ** 2)
 
-        assert len(t_hidden_states) == len(s_hidden_states)
+        # =================================================================================
+        # MODIFICATION START: Removed all hidden layer distillation logic for stability
+        # =================================================================================
 
-        proj = model.bert.distill_projection
-        t_hidden_states = [self.mask_select(t_h, mask) for t_h in t_hidden_states]
-        s_hidden_states = [proj(self.mask_select(s_h, mask)) for s_h in s_hidden_states]
+        # The following block has been removed:
+        # assert len(t_hidden_states) == len(s_hidden_states)
+        # proj = model.bert.distill_projection
+        # t_hidden_states = [self.mask_select(t_h, mask) for t_h in t_hidden_states]
+        # s_hidden_states = [proj(self.mask_select(s_h, mask)) for s_h in s_hidden_states]
+        # ... layer matching algorithm ...
+        # ... feature_weight calculation ...
+        # ... _layer_loss calculation ...
+        # ... total_layer_loss calculation ...
 
-        # 层匹配算法
-        match_index = []
-        with torch.no_grad():
-            T_tensor = torch.stack(t_hidden_states).unsqueeze(0)
-            S_tensor = torch.stack(s_hidden_states).unsqueeze(1)
-            dist = (T_tensor - S_tensor).pow(2.).mean(-1).mean(-1)
-            assert len(dist.shape) == 2
+        # ✅ 使用简化的损失
+        distill_loss = adaptive_distill_lambda * pred_loss
 
-        num_layers = len(s_hidden_states)
-        for i in range(num_layers):
-            match_index.append(dist[i, i:].argmin().item() + i)
-
-        # ✅ 温和的特征损失权重
-        feature_weight = min(current_sparsity * 1.0, 0.3)  # 限制最大权重
-
-        _layer_loss = []
-        for i, (ffn_mask, s_h) in enumerate(zip(self.ffn_masks, s_hidden_states)):
-            if i < len(match_index):
-                t_h = t_hidden_states[match_index[i]]
-                layer_loss = self.mse_loss(t_h, s_h)
-                _layer_loss.append(layer_loss)
-
-        if _layer_loss:
-            total_layer_loss = torch.stack(_layer_loss).mean()  # 使用mean而不是sum
-        else:
-            total_layer_loss = torch.tensor(0.0, device=pred_loss.device)
-
-        # ✅ 使用温和的权重组合损失
-        distill_loss = adaptive_distill_lambda * pred_loss + feature_weight * total_layer_loss
+        # =================================================================================
+        # MODIFICATION END
+        # =================================================================================
 
         return distill_loss
 
@@ -653,10 +743,14 @@ class DistillTrainer(DefaultTrainer):
         return self.target_sparsity
 
     def compute_lagrangian_loss(self):
-        """传统的拉格朗日损失计算（保留兼容性）"""
-        s = self.compute_sparsity()
+        """传统的拉格朗日损失计算（保留兼容性, 用于评估）"""
+        # MODIFICATION: Use actual sparsity for this calculation too for consistency
+        s = self._compute_current_sparsity(unwrap_model(self.model))
         t = self.compute_target_sparsity()
 
+        # These lambdas are part of the model parameters for a different optimization method
+        # which might not be actively used if StableLagrangianOptimizer is in effect.
+        # We keep this for evaluation purposes as requested by original structure.
         lambda_1 = self.model.bert.reg_lambda_1
         lambda_2 = self.model.bert.reg_lambda_2
         lagrangian_loss = lambda_1 * (s - t).abs() + lambda_2 * torch.pow(s - t, 2.)
@@ -664,8 +758,10 @@ class DistillTrainer(DefaultTrainer):
 
     def compute_sparsity(self):
         """
-        ✅ 修复后的稀疏性计算
-        返回真正的稀疏率（被剪掉的参数比例）
+        ✅ 理论稀疏性计算
+        返回基于mask参数的理论稀疏率
+        NOTE: This method is now considered deprecated for control and primary evaluation,
+        but kept for potential diagnostic purposes. The primary metric is _compute_current_sparsity.
         """
         num_layers = 12
         num_heads = 12
@@ -698,7 +794,6 @@ class DistillTrainer(DefaultTrainer):
 
         total_remaining = torch.stack(remaining_params).sum()
 
-        # ✅ 稀疏率 = 1 - 保留率
         sparsity = 1.0 - (total_remaining / total_params)
 
         return sparsity
@@ -727,8 +822,7 @@ class DistillTrainer(DefaultTrainer):
                 else:
                     lambda_2_val = lambda_2
 
-                # 计算稀疏率
-                sparsity = self.compute_sparsity()
+                # MODIFICATION: Unify sparsity reporting
                 actual_sparsity = self._compute_current_sparsity(unwrap_model(self.model))
                 t_sparsity = self.compute_target_sparsity()
 
@@ -740,12 +834,12 @@ class DistillTrainer(DefaultTrainer):
                     lagrangian_val = 0.0
 
                 print(f"📊 训练统计:")
-                print(f"   λ₁: {lambda_1_val:.6f}")
-                print(f"   λ₂: {lambda_2_val:.6f}")
-                print(f"   系统稀疏率: {sparsity:.4f}")
-                print(f"   实际稀疏率: {actual_sparsity:.4f}")
+                print(f"   λ₁ (model param): {lambda_1_val:.6f}")
+                print(f"   λ₂ (model param): {lambda_2_val:.6f}")
+                # print(f"   系统稀疏率: {sparsity:.4f}") # REMOVED: Deprecating theoretical sparsity
+                print(f"   实际稀疏率 (Actual Sparsity): {actual_sparsity:.4f}")
                 print(f"   目标稀疏率: {t_sparsity:.4f}")
-                print(f"   拉格朗日损失: {lagrangian_val:.6f}")
+                print(f"   拉格朗日损失 (eval): {lagrangian_val:.6f}")
 
                 # 打印梯度裁剪统计
                 clip_stats = self.gradient_clipper.get_clipping_stats()
@@ -757,8 +851,8 @@ class DistillTrainer(DefaultTrainer):
                 if self.training_stats['lambda_history']['lambda1']:
                     recent_lambda1 = np.mean(self.training_stats['lambda_history']['lambda1'][-10:])
                     recent_lambda2 = np.mean(self.training_stats['lambda_history']['lambda2'][-10:])
-                    print(f"   稳定λ₁: {recent_lambda1:.6f}")
-                    print(f"   稳定λ₂: {recent_lambda2:.6f}")
+                    print(f"   稳定λ₁ (trainer): {recent_lambda1:.6f}")
+                    print(f"   稳定λ₂ (trainer): {recent_lambda2:.6f}")
 
         past_distill_switch = self.distill_switch
         self.distill_switch = False
@@ -766,7 +860,8 @@ class DistillTrainer(DefaultTrainer):
         self.distill_switch = past_distill_switch
 
         with torch.no_grad():
-            results['sparsity'] = self.compute_sparsity()
+            # MODIFICATION: Unify sparsity reporting in results dict
+            # results['sparsity'] = self.compute_sparsity() # REMOVED
             results['actual_sparsity'] = self._compute_current_sparsity(unwrap_model(self.model))
             results['target_sparsity'] = self.compute_target_sparsity()
 
