@@ -17,6 +17,59 @@ from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 import warnings
 from enum import Enum
+from scipy.stats import norm
+
+def _get_privacy_spent(noise_multiplier: float, delta: float) -> float:
+    """计算高斯机制下单次扰动的(epsilon, delta)-DP。"""
+    if noise_multiplier == 0:
+        return float('inf')
+    # RDP to (ε, δ)-DP conversion
+    # This is a standard formula for Gaussian mechanism.
+    # ε(σ) = min_α ( (α-1) * log(1 - q + q*e^(1/σ^2)) - log(δ) ) / (α-1)
+    # For q=1 (adding noise to the function output directly), it simplifies.
+    # A common and tight bound is ε = sqrt(2*log(1.25/δ)) / σ
+    return math.sqrt(2 * math.log(1.25 / delta)) / noise_multiplier
+
+class LocalDPEngine:
+    """
+    本地差分隐私引擎
+    对模型参数进行一次性加噪，并计算对应的单轮隐私花费。
+    """
+    def __init__(self,
+                 target_epsilon: float = 10.0,
+                 target_delta: float = 1e-3,
+                 max_grad_norm: float = 1.0,
+                 noise_multiplier: float = 0.3):
+        self.target_epsilon = target_epsilon
+        self.target_delta = target_delta
+        self.sensitivity = max_grad_norm # In Local DP for models, sensitivity is the clipping norm of the update
+        self.noise_multiplier = noise_multiplier
+        self.per_round_epsilon = _get_privacy_spent(
+            noise_multiplier=self.noise_multiplier,
+            delta=self.target_delta
+        )
+        print(f"✅ Local DP Engine Initialized: Each round provides ({self.per_round_epsilon:.4f}, {self.target_delta})-DP")
+        if self.per_round_epsilon > self.target_epsilon:
+             print(f"   ⚠️ Warning: Per-round epsilon {self.per_round_epsilon:.4f} exceeds target epsilon {self.target_epsilon:.4f}")
+
+    def add_noise(self, tensor: torch.Tensor) -> torch.Tensor:
+        """向张量添加校准的高斯噪声。"""
+        if not tensor.dtype.is_floating_point:
+            return tensor
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            return tensor
+
+        # Note: Clipping should happen BEFORE this function is called.
+        # The noise scale is based on the clipping norm (sensitivity).
+        noise_scale = self.sensitivity * self.noise_multiplier
+        noise = torch.normal(
+            mean=0.0,
+            std=noise_scale,
+            size=tensor.shape,
+            device=tensor.device,
+            dtype=tensor.dtype
+        )
+        return tensor + noise
 
 
 class PrivacyAccountantType(Enum):
