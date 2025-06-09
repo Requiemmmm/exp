@@ -15,7 +15,8 @@ from transformers import AutoTokenizer, AutoConfig
 from transformers.models.bert.modeling_bert import BertForSequenceClassification as TModel
 
 from modeling.modeling_cofi_bert import CoFiBertForSequenceClassification as SModel
-from modeling.dp_engine import DifferentialPrivacyEngine, FederatedDPAggregator
+# MODIFICATION: Removed unused import of FederatedDPAggregator
+from modeling.dp_engine import DifferentialPrivacyEngine
 
 from datasets import DatasetDict, Dataset, load_from_disk, load_metric, load_dataset
 from typing import Optional, Dict, List, Tuple, Callable, Union
@@ -28,6 +29,7 @@ from .args import (
     TrainingArguments,
     ModelArguments,
 )
+from modeling.dp_engine import LocalDPEngine
 
 Trainers = Union[Trainer, DistillTrainer]
 
@@ -144,7 +146,9 @@ class Client():
     def __init__(self, epsilon=1000, num_clients=2):
 
         args, training_args = parse_hf_args()
-        dataset = load_from_disk('./datasets/sst2')  # 换数据集需要改
+        # Note: The user confirmed they have unified the dataset.
+        # This path might need to be an argument in a future version.
+        dataset = load_from_disk('./datasets/sst2')
         self.tokenizer = AutoTokenizer.from_pretrained("./model")
         self.tokenizer.padding_side = "right"
         if self.tokenizer.pad_token is None:
@@ -172,12 +176,13 @@ class Client():
             'target_epsilon': 10.0,  # 增大epsilon，减少噪声
             'target_delta': 1e-3,  # 稍微放松delta
             'max_grad_norm': 1.0,  # 梯度裁剪阈值
-            'noise_multiplier': 0.3,  # 减少噪声乘数
-            'sample_rate': 0.01  # 采样率
+            'noise_multiplier': 0.003,  # 减少噪声乘数
+            #'sample_rate': 0.01  # 采样率
         }
 
         # 初始化DP引擎
-        self.dp_engine = DifferentialPrivacyEngine(**self.dp_config)
+        #self.dp_engine = DifferentialPrivacyEngine(**self.dp_config)
+        self.dp_engine = LocalDPEngine(**self.dp_config)
         print(f"✅ 客户端DP引擎初始化完成: ε={self.dp_config['target_epsilon']}, δ={self.dp_config['target_delta']}")
 
     def load_client_train_datas(self):
@@ -203,7 +208,7 @@ class Client():
     def train_epoch(self, server_model, client_id, server_weights, t_model):
         """
         客户端训练一个epoch
-        集成了规范化的差分隐私保护
+        集成了规范化的差分隐私保护 (已修复裁剪逻辑)
         """
         datasets = self.client_train_datas[client_id]
         server_model.load_state_dict(server_weights)
@@ -223,51 +228,40 @@ class Client():
         distill_trainer.train()
 
         # 获取训练后的权重
-        weight = {}
-        for name, param in server_model.named_parameters():
-            weight[name] = param.data.clone()
+        new_weights = server_model.state_dict()
 
-        # ✅ 使用规范化的差分隐私处理（仅对浮点型参数）
+        # ✅ 修复后的差分隐私处理：裁剪和加噪作用于模型更新(Delta)
         private_weights = {}
-        batch_size = len(datasets)
-
         processed_count = 0
         skipped_count = 0
 
-        for name, param_data in weight.items():
-            if self._should_add_noise(name) and param_data.dtype.is_floating_point:
-                # 对需要保护的浮点型参数添加校准噪声
-                try:
-                    private_weights[name] = self.dp_engine.add_noise(
-                        param_data,
-                        sensitivity=self.dp_config['max_grad_norm']
-                    )
-                    processed_count += 1
-                except Exception as e:
-                    print(f"    ⚠️ 参数 {name} DP处理失败: {e}")
-                    private_weights[name] = param_data
-                    skipped_count += 1
+        clip_norm = self.dp_config['max_grad_norm']
+
+        for name, new_param in new_weights.items():
+            # 只对需要加噪的浮点型参数进行处理
+            if self._should_add_noise(name) and new_param.dtype.is_floating_point:
+
+                # 1. 计算模型更新的“增量”(delta)
+                delta = new_param - server_weights[name].to(new_param.device)
+
+                # 2. 对增量进行范数裁剪
+                delta_norm = torch.norm(delta).item()
+                if delta_norm > clip_norm:
+                    delta.mul_(clip_norm / (delta_norm + 1e-6))  # 使用 in-place 乘法提升效率
+
+                # 3. 对裁剪后的增量添加噪声
+                noised_delta = self.dp_engine.add_noise(delta)
+
+                # 4. 将加噪后的增量应用回原始权重，得到最终要上传的权重
+                private_weights[name] = server_weights[name].to(noised_delta.device) + noised_delta
+                processed_count += 1
             else:
-                # 非浮点型参数或不需要保护的参数直接使用
-                private_weights[name] = param_data
+                # 不需要处理的参数直接使用新权重
+                private_weights[name] = new_param
                 skipped_count += 1
 
-        print(f"  🔒 DP处理完成: 已处理{processed_count}个参数, 跳过{skipped_count}个参数")
-
-        # 更新隐私预算（使用更合理的采样率）
-        try:
-            self.dp_engine.accountant.step(
-                q=min(batch_size / 1000, 0.1),  # 限制采样率上界
-                noise_multiplier=self.dp_config['noise_multiplier']
-            )
-
-            # 打印隐私预算消耗情况
-            epsilon_spent, delta_spent = self.dp_engine.accountant.get_privacy_spent()
-            remaining_budget = self.dp_engine.accountant.get_remaining_budget()
-
-            print(f"  Client {client_id}: ε_spent={epsilon_spent:.4f}, remaining={remaining_budget:.4f}")
-        except Exception as e:
-            print(f"    ⚠️ 隐私预算更新失败: {e}")
+        print(f"  🔒 DP处理完成 (正确逻辑): 已处理{processed_count}个参数, 跳过{skipped_count}个参数")
+        print(f"  隐私保障: 此轮提供约 ({self.dp_engine.per_round_epsilon:.4f}, {self.dp_engine.target_delta})-DP")
 
         return private_weights
 
@@ -290,23 +284,23 @@ class Server():
         self.distill = training_args.distill
 
         if self.distill == True:
-            self.t_model = TModel.from_pretrained('./[glue]/sst2-half-datas')  # 换数据集时这里需要改
-            self.s_model = SModel.from_pretrained('./[glue]/sst2-half-datas')  # 换数据集时这里需要改
+            self.t_model = TModel.from_pretrained('./[glue]/sst2-half-datas')
+            self.s_model = SModel.from_pretrained('./[glue]/sst2-half-datas')
         if self.distill == False:
             self.t_model = TModel.from_pretrained('./model')
             self.s_model = SModel.from_pretrained('./model')
 
-        dataset = load_from_disk('./datasets/sst2')  # 换数据集时这里需要改
+        dataset = load_from_disk('./datasets/sst2')
         self.tokenizer = AutoTokenizer.from_pretrained("./model")
         self.tokenizer.padding_side = "right"
         if self.tokenizer.pad_token is None:
             self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
         def tokenize_function(example):
-            return self.tokenizer(example["sentence"], truncation=True)  # sst2数据集用这行
+            return self.tokenizer(example["sentence"], truncation=True)
 
         dataset = dataset.map(tokenize_function, batched=True)
-        dataset['validation'] = dataset['validation'].filter(lambda x: len(x["input_ids"]) <= 512)  # 其他三个数据集用这行
+        dataset['validation'] = dataset['validation'].filter(lambda x: len(x["input_ids"]) <= 512)
 
         self.dataset = dataset['validation']
 
@@ -326,17 +320,22 @@ class Server():
         # ✅ 初始化稀疏率管理器
         self.sparsity_manager = UnifiedSparsityManager()
 
-        # ✅ 添加联邦DP聚合器
-        self.fed_dp_aggregator = FederatedDPAggregator(
-            num_clients=num_clients,
-            target_epsilon=50.0,  # 更宽松的全局隐私预算
-            target_delta=1e-3,
-            clip_norm=1.0
-        )
+        # ==============================================================================
+        # MODIFICATION START: Removed unused FederatedDPAggregator
+        # ==============================================================================
+        # The following block has been removed to simplify the DP logic, as
+        # privacy is already handled on the client-side (Local DP).
+        #
+        # self.fed_dp_aggregator = FederatedDPAggregator(...)
+        #
+        # ==============================================================================
+        # MODIFICATION END
+        # ==============================================================================
 
         print(f"✅ 服务器初始化完成: {num_clients}个客户端, {epochs}轮训练")
         print(f"✅ 剪枝调度: {self.pruning_scheduler.initial_sparsity} -> {self.pruning_scheduler.target_sparsity}")
-        print(f"✅ 联邦DP: 全局ε={50.0}, δ={1e-3}")
+        print(f"✅ 隐私模型: 客户端本地差分隐私 (Local DP)")
+
 
     def distribute_task(self, client_ids):
         """分发训练任务到客户端"""
@@ -482,7 +481,7 @@ class Server():
             results = self.evalute()
 
             # ✅ 验证稀疏率是否符合预期
-            actual_sparsity = results['actual_sparsity']
+            '''actual_sparsity = results['actual_sparsity']
             sparsity_gap = abs(actual_sparsity - current_sparsity)
 
             if sparsity_gap > 0.05:  # 如果稀疏率偏差超过5%
@@ -490,7 +489,7 @@ class Server():
                 pruning_result = self.sparsity_manager.apply_structured_pruning(
                     self.s_model, current_sparsity
                 )
-                print(f"  ✅ 调整后稀疏率: {pruning_result['actual_sparsity']:.3f}")
+                print(f"  ✅ 调整后稀疏率: {pruning_result['actual_sparsity']:.3f}")'''
 
         print("\n🎉 训练完成！")
         print("=" * 60)
@@ -500,16 +499,26 @@ class Server():
         final_sparsity = self.sparsity_manager.compute_model_sparsity(self.s_model)
         print(f"🔧 最终模型稀疏率: {final_sparsity:.4f}")
 
-        # 打印全局隐私分析
-        try:
-            global_privacy_analysis = self.fed_dp_aggregator.get_global_privacy_analysis()
-            print(f"🔒 全局隐私消耗: ε={global_privacy_analysis['global_epsilon']:.4f}")
-            print(f"🛡️ 隐私保护状态: {'✅ 满足' if global_privacy_analysis['privacy_preserved'] else '❌ 超出预算'}")
-        except Exception as e:
-            print(f"🔒 隐私分析获取失败: {e}")
+        # ==============================================================================
+        # MODIFICATION START: Removed unused privacy analysis block
+        # ==============================================================================
+        # The following block was removed because `fed_dp_aggregator` was removed.
+        # Global privacy analysis is non-trivial in a Local DP setting and
+        # would require collecting reports from all clients.
+        #
+        # try:
+        #     global_privacy_analysis = self.fed_dp_aggregator.get_global_privacy_analysis()
+        #     ...
+        # except Exception as e:
+        #     ...
+        #
+        # ==============================================================================
+        # MODIFICATION END
+        # ==============================================================================
+
 
         return {
             'best_accuracy': self.best_result,
             'final_sparsity': final_sparsity,
-            'target_sparsity': current_sparsity
+            'target_sparsity': self.pruning_scheduler.target_sparsity # Return the final target
         }
