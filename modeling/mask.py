@@ -24,33 +24,36 @@ class Mask(nn.Module):
     max_s = 1.1
     eps = 1e-6
     magical_number = 0.8
-    
+
     def __init__(self, features: int, repeat: int = 1) -> None:
         super().__init__()
-        self.activate = nn.Parameter(torch.tensor(True), requires_grad=False)
+        # MODIFIED: Changed from torch.tensor(True) to torch.tensor(1.0) to fix type conflict.
+        self.activate = nn.Parameter(torch.tensor(1.0), requires_grad=False)
         self.features = features * repeat
         self.repeat = repeat
         self.beta = 2. / 3.
         self.log_alpha = nn.Parameter(torch.zeros((features,)))
         self.sampler = torch.distributions.Uniform(self.eps, 1. - self.eps)
         self.set_params(10.0)
-    
+
     def set_state(self, activate: bool):
-        self.activate.copy_(activate)
-    
+        # To maintain compatibility, we accept a boolean but store as float.
+        self.activate.copy_(torch.tensor(1.0 if activate else 0.0))
+
     @torch.no_grad()
     def set_params(self, mean: float, indices: Optional[torch.LongTensor] = None):  # [-10, 10]
         if indices is None:
             self.log_alpha.normal_(mean=mean, std=1e-2)
         else:
             self.log_alpha[indices].normal_(mean=mean, std=1e-2)
-    
+
     def L(self):
         log_alpha = self.log_alpha.repeat(self.repeat)
         x = (0 - self.min_s) / (self.max_s - self.min_s)
         logits = math.log(x) - math.log(1 - x)
-        L = torch.sigmoid(log_alpha - logits * self.beta).clamp(min=self.eps, max=1-self.eps)
-        if not self.activate.item():
+        L = torch.sigmoid(log_alpha - logits * self.beta).clamp(min=self.eps, max=1 - self.eps)
+        # Use activate as a float multiplier (1.0 or 0.0)
+        if self.activate.item() == 0.0:
             L = L.detach()
         return L
 
@@ -61,20 +64,22 @@ class Mask(nn.Module):
         s_bar = s * (self.max_s - self.min_s) + self.min_s
         z = F.hardtanh(s_bar, min_val=0, max_val=1)
         return z
-    
+
     def deterministic_z(self):
         sub_features = self.features // self.repeat
         Lc = self.L().sum() / self.repeat
         num_zeros = round(sub_features - Lc.item()) * self.repeat
         log_alpha = self.log_alpha.repeat(self.repeat)
         z = torch.sigmoid(log_alpha / self.beta * self.magical_number)
-        if num_zeros > 0:
+        if num_zeros > 0 and num_zeros < z.numel():
             _, indices = torch.topk(z, k=num_zeros, largest=False)
             z[indices] = 0
+        elif num_zeros >= z.numel():
+            z.fill_(0)
         return z
-    
+
     def forward(self):
-        if self.activate.item():
+        if self.activate.item() == 1.0:
             if self.training:
                 return self.sample_z()
             else:
@@ -89,7 +94,7 @@ class Mask(nn.Module):
         num_zeros = round(sub_features - Lc.item())
         num_non_zeros = sub_features - num_zeros
         z = torch.sigmoid(self.log_alpha / self.beta * self.magical_number)
-        
+
         if num_non_zeros < 1:
             num_non_zeros = 1
 
@@ -101,31 +106,28 @@ class Mask(nn.Module):
         return z[indices], indices
 
 
-
-
-
 class LinearWithMaskBefore(nn.Linear):
-    
-    def __init__(self, 
-        in_features: int, 
-        out_features: int, 
-        bias: bool = True, 
-        device=None, 
-        dtype=None,
-    ) -> None:
+
+    def __init__(self,
+                 in_features: int,
+                 out_features: int,
+                 bias: bool = True,
+                 device=None,
+                 dtype=None,
+                 ) -> None:
         super().__init__(in_features, out_features, bias, device, dtype)
         self.mask = Mask(in_features)
         self.kw_args = {
             "in_features": in_features,
             "out_features": out_features,
             "bias": bias,
-            "device": device, 
+            "device": device,
             "dtype": dtype,
         }
 
     def super_forward(self, x: Tensor) -> Tensor:
         return super().forward(x)
-    
+
     def forward(self, x: Tensor) -> Tensor:
         x = x * self.mask()
         x = super().forward(x)
@@ -141,20 +143,21 @@ class LinearWithMaskBefore(nn.Linear):
             if name not in act_dict:
                 act_dict[name] = values
             else:
-                act_dict[name] = torch.max(act_dict[name], values)            
+                act_dict[name] = torch.max(act_dict[name], values)
+
         return fn
 
     def extract(self,
-        indices: torch.Tensor,
-        values: Optional[torch.Tensor] = None,
-    ) -> nn.Linear:
+                indices: torch.Tensor,
+                values: Optional[torch.Tensor] = None,
+                ) -> nn.Linear:
         if values is None:
             values = torch.ones_like(indices, dtype=self.weight.dtype)
         values = torch.diag(values)
 
         self.kw_args["in_features"] = indices.shape[0]
-        new_linear = nn.Linear(**self.kw_args)        
+        new_linear = nn.Linear(**self.kw_args)
         new_linear.weight.copy_(self.weight[:, indices] @ values)
         if new_linear.bias is not None:
-            new_linear.bias.copy_(self.bias)        
+            new_linear.bias.copy_(self.bias)
         return new_linear
