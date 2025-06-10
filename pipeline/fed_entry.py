@@ -177,11 +177,11 @@ class Client():
             'target_delta': 1e-3,  # 稍微放松delta
             'max_grad_norm': 1.0,  # 梯度裁剪阈值
             'noise_multiplier': 0.003,  # 减少噪声乘数
-            #'sample_rate': 0.01  # 采样率
+            # 'sample_rate': 0.01  # 采样率
         }
 
         # 初始化DP引擎
-        #self.dp_engine = DifferentialPrivacyEngine(**self.dp_config)
+        # self.dp_engine = DifferentialPrivacyEngine(**self.dp_config)
         self.dp_engine = LocalDPEngine(**self.dp_config)
         print(f"✅ 客户端DP引擎初始化完成: ε={self.dp_config['target_epsilon']}, δ={self.dp_config['target_delta']}")
 
@@ -241,7 +241,7 @@ class Client():
             # 只对需要加噪的浮点型参数进行处理
             if self._should_add_noise(name) and new_param.dtype.is_floating_point:
 
-                # 1. 计算模型更新的“增量”(delta)
+                # 1. 计算模型更新的"增量"(delta)
                 delta = new_param - server_weights[name].to(new_param.device)
 
                 # 2. 对增量进行范数裁剪
@@ -320,22 +320,9 @@ class Server():
         # ✅ 初始化稀疏率管理器
         self.sparsity_manager = UnifiedSparsityManager()
 
-        # ==============================================================================
-        # MODIFICATION START: Removed unused FederatedDPAggregator
-        # ==============================================================================
-        # The following block has been removed to simplify the DP logic, as
-        # privacy is already handled on the client-side (Local DP).
-        #
-        # self.fed_dp_aggregator = FederatedDPAggregator(...)
-        #
-        # ==============================================================================
-        # MODIFICATION END
-        # ==============================================================================
-
         print(f"✅ 服务器初始化完成: {num_clients}个客户端, {epochs}轮训练")
         print(f"✅ 剪枝调度: {self.pruning_scheduler.initial_sparsity} -> {self.pruning_scheduler.target_sparsity}")
         print(f"✅ 隐私模型: 客户端本地差分隐私 (Local DP)")
-
 
     def distribute_task(self, client_ids):
         """分发训练任务到客户端"""
@@ -357,58 +344,149 @@ class Server():
 
         return client_weight_datas
 
-    def federated_average(self, client_weight_datas):
-        """
-        修复后的联邦平均聚合算法
-        使用类型感知的安全聚合
-        """
-        client_num = len(client_weight_datas)
-        if client_num == 0:
-            raise ValueError("No client weights received")
+    def federated_average(self, client_weights, client_data_sizes=None, client_masks=None):
+        """修复后的联邦平均聚合"""
+        if not client_weights:
+            raise ValueError("No client weights provided")
 
-        print(f"  🔄 聚合 {client_num} 个客户端的权重...")
+        # 计算权重（基于数据量）
+        if client_data_sizes is None:
+            weights = [1.0 / len(client_weights)] * len(client_weights)
+        else:
+            total_samples = sum(client_data_sizes)
+            weights = [size / total_samples for size in client_data_sizes]
 
-        # ✅ 使用类型感知的安全聚合
-        aggregated_weights = self._type_aware_aggregate(client_weight_datas)
+        print(f"  🔄 聚合 {len(client_weights)} 个客户端的权重...")
 
-        self.s_model.load_state_dict(aggregated_weights)
-        return aggregated_weights
+        # 聚合模型权重 - 完全重写以确保类型安全
+        aggregated_weights = {}
+        first_client = client_weights[0]
 
-    def _type_aware_aggregate(self, client_weight_datas):
+        print(f"  🔄 聚合 {len(client_weights)} 个客户端的权重...")
+
+        for key in first_client.keys():
+            try:
+                # 检查第一个客户端的参数
+                first_param = first_client[key]
+                if first_param is None:
+                    aggregated_weights[key] = None
+                    continue
+
+                # 收集所有客户端的有效参数
+                valid_params = []
+                valid_weights = []
+
+                for i, (client_weight, weight) in enumerate(zip(client_weights, weights)):
+                    if client_weight[key] is not None:
+                        valid_params.append(client_weight[key])
+                        valid_weights.append(weight)
+
+                if not valid_params:
+                    aggregated_weights[key] = None
+                    continue
+
+                # 根据数据类型选择聚合策略
+                if not first_param.dtype.is_floating_point:
+                    # 非浮点型参数处理
+                    if first_param.dtype == torch.bool:
+                        # 布尔型：加权投票，使用float32中间计算
+                        vote_accumulator = torch.zeros_like(first_param, dtype=torch.float32)
+                        for param, weight in zip(valid_params, valid_weights):
+                            vote_accumulator += weight * param.float()
+                        # 转换回布尔型
+                        aggregated_weights[key] = (vote_accumulator > 0.5).to(torch.bool)
+                    else:
+                        # 其他整型：直接使用第一个
+                        aggregated_weights[key] = first_param.clone()
+                else:
+                    # 浮点型参数：标准加权平均
+                    weighted_sum = torch.zeros_like(first_param, dtype=first_param.dtype)
+                    for param, weight in zip(valid_params, valid_weights):
+                        weighted_sum += weight * param
+                    aggregated_weights[key] = weighted_sum
+
+            except Exception as e:
+                print(f"    ⚠️ 参数 {key} 聚合失败: {e}")
+                # 使用第一个客户端的参数作为备选
+                aggregated_weights[key] = first_client[key].clone() if first_client[key] is not None else None
+
+        # 如果有mask信息，同时聚合mask
+        aggregated_masks = None
+        if client_masks:
+            aggregated_masks = {}
+            for key in client_masks[0].keys():
+                try:
+                    votes = torch.stack([mask[key] for mask in client_masks])
+                    # 使用浮点型进行计算，然后转换回原类型
+                    weighted_votes = torch.zeros_like(votes[0], dtype=torch.float32)
+                    for vote, weight in zip(votes, weights):
+                        weighted_votes += weight * vote.float()
+                    aggregated_masks[key] = (weighted_votes > 0.5).to(votes[0].dtype)
+                except Exception as e:
+                    print(f"    ⚠️ Mask {key} 聚合失败: {e}")
+                    aggregated_masks[key] = client_masks[0][key]
+
+        # 应用聚合结果到模型
+        self.apply_aggregated_results(aggregated_weights, aggregated_masks)
+
+        return aggregated_weights, aggregated_masks
+
+    def apply_aggregated_results(self, aggregated_weights, aggregated_masks=None):
+        """应用聚合结果到模型"""
+        # 应用权重
+        self.s_model.load_state_dict(aggregated_weights, strict=False)
+
+        # 应用mask（如果有）
+        if aggregated_masks and hasattr(self.s_model, 'differentiable_masks'):
+            for name, mask in aggregated_masks.items():
+                if hasattr(self.s_model, 'differentiable_masks') and name in self.s_model.differentiable_masks:
+                    self.s_model.differentiable_masks[name].data = mask
+
+    def _type_aware_aggregate(self, client_weight_datas, client_weights=None):
         """类型感知的安全聚合"""
         client_num = len(client_weight_datas)
         first_weights = client_weight_datas[0]
+
+        # 如果没有提供权重，则使用平均权重
+        if client_weights is None:
+            client_weights = [1.0 / client_num] * client_num
 
         aggregated_weights = {}
         processed_params = 0
 
         for key in first_weights.keys():
-            first_param = first_weights[0][key] if isinstance(first_weights, list) else first_weights[key]
+            first_param = first_weights[key]
 
             try:
+                if first_param is None:
+                    aggregated_weights[key] = None
+                    continue
+
                 if not first_param.dtype.is_floating_point:
                     # 非浮点型参数：使用多数投票或直接复制
                     if first_param.dtype == torch.bool:
-                        # 布尔型参数：多数投票
+                        # 布尔型参数：加权多数投票
                         vote_sum = torch.zeros_like(first_param, dtype=torch.float32)
-                        for weights in client_weight_datas:
-                            vote_sum += weights[key].float()
-                        aggregated_weights[key] = (vote_sum > client_num / 2).to(first_param.dtype)
+                        for weights, weight in zip(client_weight_datas, client_weights):
+                            if weights[key] is not None:
+                                vote_sum += weight * weights[key].float()
+                        aggregated_weights[key] = (vote_sum > 0.5).to(first_param.dtype)
                     else:
-                        # 其他整型参数：使用第一个值
+                        # 其他整型参数：使用第一个值（通常这些参数不需要聚合）
                         aggregated_weights[key] = first_param.clone()
                 else:
                     # 浮点型参数：加权平均
                     aggregated_weights[key] = torch.zeros_like(first_param)
-                    for weights in client_weight_datas:
-                        aggregated_weights[key] += weights[key] / client_num
+                    for weights, weight in zip(client_weight_datas, client_weights):
+                        if weights[key] is not None:
+                            aggregated_weights[key] += weight * weights[key]
 
                 processed_params += 1
 
             except Exception as e:
                 print(f"    ⚠️ 参数 {key} 聚合失败: {e}")
                 # 备用方案：使用第一个客户端的权重
-                aggregated_weights[key] = first_param.clone()
+                aggregated_weights[key] = first_param.clone() if first_param is not None else None
 
         print(f"  ✅ 安全聚合完成: 处理{processed_params}个参数")
         return aggregated_weights
@@ -475,21 +553,12 @@ class Server():
             # 分发任务和聚合
             client_ids = [i for i in range(self.num_clients)]
             client_weight_datas = self.distribute_task(client_ids)
-            self.federated_average(client_weight_datas)
+
+            # 使用修复后的联邦平均函数
+            aggregated_weights, aggregated_masks = self.federated_average(client_weight_datas)
 
             # 评估性能
             results = self.evalute()
-
-            # ✅ 验证稀疏率是否符合预期
-            '''actual_sparsity = results['actual_sparsity']
-            sparsity_gap = abs(actual_sparsity - current_sparsity)
-
-            if sparsity_gap > 0.05:  # 如果稀疏率偏差超过5%
-                print(f"  🔧 稀疏率偏差过大({sparsity_gap:.3f})，进行结构化剪枝调整...")
-                pruning_result = self.sparsity_manager.apply_structured_pruning(
-                    self.s_model, current_sparsity
-                )
-                print(f"  ✅ 调整后稀疏率: {pruning_result['actual_sparsity']:.3f}")'''
 
         print("\n🎉 训练完成！")
         print("=" * 60)
@@ -499,26 +568,8 @@ class Server():
         final_sparsity = self.sparsity_manager.compute_model_sparsity(self.s_model)
         print(f"🔧 最终模型稀疏率: {final_sparsity:.4f}")
 
-        # ==============================================================================
-        # MODIFICATION START: Removed unused privacy analysis block
-        # ==============================================================================
-        # The following block was removed because `fed_dp_aggregator` was removed.
-        # Global privacy analysis is non-trivial in a Local DP setting and
-        # would require collecting reports from all clients.
-        #
-        # try:
-        #     global_privacy_analysis = self.fed_dp_aggregator.get_global_privacy_analysis()
-        #     ...
-        # except Exception as e:
-        #     ...
-        #
-        # ==============================================================================
-        # MODIFICATION END
-        # ==============================================================================
-
-
         return {
             'best_accuracy': self.best_result,
             'final_sparsity': final_sparsity,
-            'target_sparsity': self.pruning_scheduler.target_sparsity # Return the final target
+            'target_sparsity': self.pruning_scheduler.target_sparsity  # Return the final target
         }
